@@ -6,7 +6,7 @@ package net
 import (
 	"context"
 
-	"github.com/shirou/gopsutil/v4/internal/common"
+	"github.com/wartiva/gopsutil/v4/internal/common"
 )
 
 func IOCountersWithContext(_ context.Context, _ bool) ([]IOCountersStat, error) {

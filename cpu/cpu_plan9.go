@@ -9,8 +9,7 @@ import (
 	"runtime"
 
 	stats "github.com/lufia/plan9stats"
-
-	"github.com/shirou/gopsutil/v4/internal/common"
+	"github.com/wartiva/gopsutil/v4/internal/common"
 )
 
 func Times(percpu bool) ([]TimesStat, error) {

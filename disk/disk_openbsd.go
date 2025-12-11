@@ -8,9 +8,8 @@ import (
 	"context"
 	"encoding/binary"
 
+	"github.com/wartiva/gopsutil/v4/internal/common"
 	"golang.org/x/sys/unix"
-
-	"github.com/shirou/gopsutil/v4/internal/common"
 )
 
 func PartitionsWithContext(_ context.Context, _ bool) ([]PartitionStat, error) {

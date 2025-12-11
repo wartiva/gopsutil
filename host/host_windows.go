@@ -13,10 +13,9 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/wartiva/gopsutil/v4/internal/common"
+	"github.com/wartiva/gopsutil/v4/process"
 	"golang.org/x/sys/windows"
-
-	"github.com/shirou/gopsutil/v4/internal/common"
-	"github.com/shirou/gopsutil/v4/process"
 )
 
 var (

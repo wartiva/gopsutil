@@ -8,9 +8,8 @@ import (
 	"errors"
 	"unsafe"
 
+	"github.com/wartiva/gopsutil/v4/internal/common"
 	"golang.org/x/sys/unix"
-
-	"github.com/shirou/gopsutil/v4/internal/common"
 )
 
 func VirtualMemory() (*VirtualMemoryStat, error) {

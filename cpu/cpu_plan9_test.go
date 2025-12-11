@@ -12,8 +12,7 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/shirou/gopsutil/v4/internal/common"
+	"github.com/wartiva/gopsutil/v4/internal/common"
 )
 
 var timesTests = []struct {

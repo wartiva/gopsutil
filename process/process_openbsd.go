@@ -15,12 +15,11 @@ import (
 	"strings"
 	"unsafe"
 
+	"github.com/wartiva/gopsutil/v4/cpu"
+	"github.com/wartiva/gopsutil/v4/internal/common"
+	"github.com/wartiva/gopsutil/v4/mem"
+	"github.com/wartiva/gopsutil/v4/net"
 	"golang.org/x/sys/unix"
-
-	"github.com/shirou/gopsutil/v4/cpu"
-	"github.com/shirou/gopsutil/v4/internal/common"
-	"github.com/shirou/gopsutil/v4/mem"
-	"github.com/shirou/gopsutil/v4/net"
 )
 
 func pidsWithContext(ctx context.Context) ([]int32, error) {

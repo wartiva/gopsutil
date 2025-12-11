@@ -28,7 +28,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/shirou/gopsutil/v4/common"
+	"github.com/wartiva/gopsutil/v4/common"
 )
 
 var (

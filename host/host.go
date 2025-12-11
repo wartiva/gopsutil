@@ -10,7 +10,7 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/shirou/gopsutil/v4/internal/common"
+	"github.com/wartiva/gopsutil/v4/internal/common"
 )
 
 type Warnings = common.Warnings

@@ -12,9 +12,8 @@ import (
 	"syscall"
 	"unsafe"
 
+	"github.com/wartiva/gopsutil/v4/internal/common"
 	"golang.org/x/sys/windows"
-
-	"github.com/shirou/gopsutil/v4/internal/common"
 )
 
 var (

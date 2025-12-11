@@ -8,9 +8,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/shirou/gopsutil/v4/cpu"
-	"github.com/shirou/gopsutil/v4/internal/common"
-	"github.com/shirou/gopsutil/v4/net"
+	"github.com/wartiva/gopsutil/v4/cpu"
+	"github.com/wartiva/gopsutil/v4/internal/common"
+	"github.com/wartiva/gopsutil/v4/net"
 )
 
 type MemoryMapsStat struct {

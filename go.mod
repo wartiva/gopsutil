@@ -1,4 +1,4 @@
-module github.com/shirou/gopsutil/v4
+module github.com/wartiva/gopsutil/v4
 
 go 1.24.0
 

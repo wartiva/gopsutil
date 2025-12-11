@@ -8,7 +8,7 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/shirou/gopsutil/v4/internal/common"
+	"github.com/wartiva/gopsutil/v4/internal/common"
 )
 
 func IOCountersWithContext(_ context.Context, _ ...string) (map[string]IOCountersStat, error) {

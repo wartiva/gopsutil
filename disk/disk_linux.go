@@ -14,9 +14,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/wartiva/gopsutil/v4/internal/common"
 	"golang.org/x/sys/unix"
-
-	"github.com/shirou/gopsutil/v4/internal/common"
 )
 
 const (

@@ -1,6 +1,6 @@
 # gopsutil: psutil for golang
 
-[![Test](https://github.com/shirou/gopsutil/actions/workflows/test.yml/badge.svg)](https://github.com/shirou/gopsutil/actions/workflows/test.yml) [![Go Reference](https://pkg.go.dev/badge/github.com/shirou/gopsutil/v4.svg)](https://pkg.go.dev/github.com/shirou/gopsutil/v4) [![Calendar Versioning](https://img.shields.io/badge/calver-vMAJOR.YY.MM-22bfda.svg)](https://calver.org/)
+[![Test](https://github.com/shirou/gopsutil/actions/workflows/test.yml/badge.svg)](https://github.com/shirou/gopsutil/actions/workflows/test.yml) [![Go Reference](https://pkg.go.dev/badge/github.com/wartiva/gopsutil/v4.svg)](https://pkg.go.dev/github.com/wartiva/gopsutil/v4) [![Calendar Versioning](https://img.shields.io/badge/calver-vMAJOR.YY.MM-22bfda.svg)](https://calver.org/)
 
 This is a port of psutil (https://github.com/giampaolo/psutil). The
 challenge is porting all psutil functions on some architectures.
@@ -51,7 +51,7 @@ package main
 import (
     "fmt"
 
-    "github.com/shirou/gopsutil/v4/mem"
+    "github.com/wartiva/gopsutil/v4/mem"
 )
 
 func main() {
@@ -132,7 +132,7 @@ gopsutil aims to minimize platform differences by offering common functions. How
 
 ## Documentation
 
-See https://pkg.go.dev/github.com/shirou/gopsutil/v4 or https://godocs.io/github.com/shirou/gopsutil/v4
+See https://pkg.go.dev/github.com/wartiva/gopsutil/v4 or https://godocs.io/github.com/wartiva/gopsutil/v4
 
 ## Requirements
 
