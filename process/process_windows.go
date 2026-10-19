@@ -11,10 +11,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"reflect"
+	"slices"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
-	"unicode/utf16"
 	"unsafe"
 
 	"github.com/wartiva/gopsutil/v4/cpu"
@@ -690,98 +691,355 @@ func (p *Process) ChildrenWithContext(ctx context.Context) ([]*Process, error) {
 	return out, nil
 }
 
+// OpenFilesWithContext returns the regular files process p has open. It captures the system handle table to do so; a
+// caller reading the open files of many processes should take one [OpenFilesSnapshot] and read each process from it.
 func (p *Process) OpenFilesWithContext(ctx context.Context) ([]OpenFilesStat, error) {
-	files := make([]OpenFilesStat, 0)
-	fileExists := make(map[string]bool)
+	snapshot, err := newOpenFilesSnapshot(p.Pid)
+	if err != nil {
+		return nil, err
+	}
+	return snapshot.OpenFiles(ctx, p.Pid)
+}
 
-	process, err := windows.OpenProcess(common.ProcessQueryInformation, false, uint32(p.Pid))
+const (
+	// fileQueryTimeout bounds each query on a duplicated file handle. A file opened for synchronous I/O with a request
+	// pending blocks every query on it until that request completes, so the queries run on their own goroutine and
+	// the handle is skipped if they take longer.
+	fileQueryTimeout = 100 * time.Millisecond
+	// maxFileQueriesInFlight bounds the query goroutines that have not yet returned, including those abandoned after
+	// [fileQueryTimeout]. A blocked query holds an OS thread until it returns, so without a bound blocked queries
+	// would accumulate across snapshots until the runtime's thread limit ends the process.
+	maxFileQueriesInFlight = 32
+	// minHandleTableBuffer is the first buffer size tried for the system handle table.
+	minHandleTableBuffer = 1 << 20
+	// maxHandleTableBuffer bounds the buffer for the system handle table, which holds about 40 bytes per handle open
+	// on the system.
+	maxHandleTableBuffer = 1 << 30
+)
+
+// handleTableSizeHint is the size of the last system handle table read, so the next read usually needs one query.
+var handleTableSizeHint atomic.Uint32
+
+// fileQueriesInFlight counts the goroutines started by [regularFilePath] that have not yet returned.
+var fileQueriesInFlight atomic.Int32
+
+// fileQueryObjects maps the kernel address of each file object that a query goroutine is still running on, including
+// one abandoned after [fileQueryTimeout], to the int32 pid of the process whose handle it was read through. Every
+// query on a blocked file object blocks too, so further handles to that object, whether duplicates, another process's
+// or a later snapshot's, are skipped instead of taking another slot of [maxFileQueriesInFlight].
+var fileQueryObjects sync.Map
+
+// ErrorFileQueriesSaturated is returned by [OpenFilesSnapshot.OpenFiles], with the files read so far, when
+// [maxFileQueriesInFlight] earlier queries are still blocked and the remaining handles cannot be read. The process's
+// open files are then unknown rather than absent. The returned error wraps it and names the pids whose handles the
+// blocked queries were read through, when the handle table reported their file objects.
+var ErrorFileQueriesSaturated = errors.New("open file queries saturated by blocked handles")
+
+// OpenFilesSnapshot is one capture of the system handle table, reduced to the file handles of each process. Reading
+// the open files of many processes from one snapshot queries the table, which lists every handle of every process,
+// once instead of once per process. Handles opened after the snapshot was taken are not seen, and handles closed
+// since are skipped. Safe for concurrent use.
+type OpenFilesSnapshot struct {
+	handles map[int32][]uintptr
+	// objects holds the kernel object address of each handle, at the same index as in handles, or 0 when the table
+	// did not report one.
+	objects map[int32][]uintptr
+}
+
+// NewOpenFilesSnapshot captures the system handle table once, keeping the file handles of every process.
+func NewOpenFilesSnapshot() (*OpenFilesSnapshot, error) {
+	return newOpenFilesSnapshot(-1)
+}
+
+// OpenFiles returns the regular files process pid had open when the snapshot was taken, one entry per path. Fd is
+// the handle value in process pid. Returns ctx.Err(), with the files read so far, when ctx is cancelled, and
+// [ErrorFileQueriesSaturated], with the files read so far, when too many earlier queries are still blocked.
+func (s *OpenFilesSnapshot) OpenFiles(ctx context.Context, pid int32) ([]OpenFilesStat, error) {
+	files := make([]OpenFilesStat, 0)
+	handles := s.handles[pid]
+	if len(handles) == 0 {
+		return files, nil
+	}
+
+	process, err := windows.OpenProcess(common.ProcessQueryInformation, false, uint32(pid))
 	if err != nil {
 		return nil, err
 	}
 	defer windows.CloseHandle(process)
 
-	buffer := make([]byte, 1024)
-	var size uint32
+	seen := make(map[string]struct{}, len(handles))
+	objects := s.objects[pid]
+	for i, value := range handles {
+		if err := ctx.Err(); err != nil {
+			return files, err
+		}
+		var object uintptr
+		if i < len(objects) {
+			object = objects[i]
+		}
+		if object != 0 {
+			if _, running := fileQueryObjects.Load(object); running {
+				continue
+			}
+		}
+		var dup windows.Handle
+		// not inheritable, so a child process started meanwhile cannot inherit another process's file
+		if windows.DuplicateHandle(process, windows.Handle(value), windows.CurrentProcess(), &dup,
+			0, false, windows.DUPLICATE_SAME_ACCESS) != nil {
+			continue
+		}
+		path, ok, err := regularFilePathOf(ctx, dup, object, pid)
+		if err != nil {
+			return files, err
+		}
+		if !ok {
+			continue
+		}
+		if _, exists := seen[path]; exists {
+			continue
+		}
+		seen[path] = struct{}{}
+		files = append(files, OpenFilesStat{Path: path, Fd: uint64(value)})
+	}
+	return files, nil
+}
 
-	st := common.CallWithExpandingBuffer(
-		func() common.NtStatus {
-			return common.NtQuerySystemInformation(
-				common.SystemExtendedHandleInformationClass,
-				&buffer[0],
-				uint32(len(buffer)),
-				&size,
-			)
-		},
-		&buffer,
-		&size,
+// newOpenFilesSnapshot captures the system handle table, keeping the file handles of process onlyPid, or of every
+// process when onlyPid is negative.
+func newOpenFilesSnapshot(onlyPid int32) (*OpenFilesSnapshot, error) {
+	// A handle to the null device, known to be a file object, identifies the file object type in the table, so the
+	// snapshot can drop the far more numerous handles of other types without duplicating them.
+	marker, err := windows.CreateFile(
+		windows.StringToUTF16Ptr("NUL"),
+		0,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
+		nil,
+		windows.OPEN_EXISTING,
+		0,
+		0,
 	)
-	if st.IsError() {
-		return nil, st.Error()
+	if err != nil {
+		marker = windows.InvalidHandle
+	} else {
+		defer windows.CloseHandle(marker)
 	}
 
-	handlesList := (*common.SystemExtendedHandleInformation)(unsafe.Pointer(&buffer[0]))
-	handles := make([]common.SystemExtendedHandleTableEntryInformation, int(handlesList.NumberOfHandles))
-	hdr := (*reflect.SliceHeader)(unsafe.Pointer(&handles))
-	hdr.Data = uintptr(unsafe.Pointer(&handlesList.Handles[0]))
-
-	currentProcess, err := windows.GetCurrentProcess()
+	table, err := readHandleTable()
 	if err != nil {
 		return nil, err
 	}
+	entries := handleTableEntries(table)
 
-	for _, handle := range handles {
-		var file uintptr
-		if int32(handle.UniqueProcessId) != p.Pid {
-			continue
-		}
-		if windows.DuplicateHandle(process, windows.Handle(handle.HandleValue), currentProcess, (*windows.Handle)(&file),
-			0, true, windows.DUPLICATE_SAME_ACCESS) != nil {
-			continue
-		}
-		// release the new handle
-		defer windows.CloseHandle(windows.Handle(file))
-
-		fileType, err := windows.GetFileType(windows.Handle(file))
-		if err != nil || fileType != windows.FILE_TYPE_DISK {
-			continue
-		}
-
-		var fileName string
-		ch := make(chan struct{})
-
-		go func() {
-			var buf [syscall.MAX_LONG_PATH]uint16
-			n, err := windows.GetFinalPathNameByHandle(windows.Handle(file), &buf[0], syscall.MAX_LONG_PATH, 0)
-			if err != nil {
-				return
+	selfPid := uintptr(windows.GetCurrentProcessId())
+	var fileType uint16
+	var fileTypeKnown bool
+	if marker != windows.InvalidHandle {
+		for i := range entries {
+			if entries[i].UniqueProcessId == selfPid && entries[i].HandleValue == uintptr(marker) {
+				fileType, fileTypeKnown = entries[i].ObjectTypeIndex, true
+				break
 			}
-
-			fileName = string(utf16.Decode(buf[:n]))
-			ch <- struct{}{}
-		}()
-
-		select {
-		case <-time.NewTimer(100 * time.Millisecond).C:
-			continue
-		case <-ch:
-			fileInfo, err := os.Stat(fileName)
-			if err != nil || fileInfo.IsDir() {
-				continue
-			}
-
-			if _, exists := fileExists[fileName]; !exists {
-				files = append(files, OpenFilesStat{
-					Path: fileName,
-					Fd:   uint64(file),
-				})
-				fileExists[fileName] = true
-			}
-		case <-ctx.Done():
-			return files, ctx.Err()
 		}
 	}
 
-	return files, nil
+	handles := make(map[int32][]uintptr)
+	objects := make(map[int32][]uintptr)
+	// kept holds each (process, file object) pair already kept, so many handles a process holds to one file object are
+	// duplicated and queried once rather than once each. OpenFiles reports one entry per path anyway.
+	type processObject struct {
+		pid    int32
+		object uintptr
+	}
+	kept := make(map[processObject]struct{})
+	for i := range entries {
+		pid := int32(entries[i].UniqueProcessId)
+		if onlyPid >= 0 && pid != onlyPid {
+			continue
+		}
+		if fileTypeKnown && entries[i].ObjectTypeIndex != fileType {
+			continue
+		}
+		if object := entries[i].Object; object != 0 {
+			key := processObject{pid: pid, object: object}
+			if _, exists := kept[key]; exists {
+				continue
+			}
+			kept[key] = struct{}{}
+		}
+		handles[pid] = append(handles[pid], entries[i].HandleValue)
+		objects[pid] = append(objects[pid], entries[i].Object)
+	}
+	return &OpenFilesSnapshot{handles: handles, objects: objects}, nil
+}
+
+// readHandleTable returns the system extended handle table. It starts from the size of the last table read, and
+// grows the buffer with headroom while the table outgrows it, up to [maxHandleTableBuffer].
+func readHandleTable() ([]byte, error) {
+	size := max(handleTableSizeHint.Load(), minHandleTableBuffer)
+	for {
+		buffer := make([]byte, size+size/8)
+		var needed uint32
+		st := common.NtQuerySystemInformation(
+			common.SystemExtendedHandleInformationClass,
+			&buffer[0],
+			uint32(len(buffer)),
+			&needed,
+		)
+		switch st {
+		case common.STATUS_INFO_LENGTH_MISMATCH, common.STATUS_BUFFER_TOO_SMALL, common.STATUS_BUFFER_OVERFLOW:
+			// the table grew, or the call did not report its size: grow by at least half
+			size = max(needed, size+size/2)
+			if size > maxHandleTableBuffer {
+				return nil, fmt.Errorf("system handle table exceeds %d bytes", maxHandleTableBuffer)
+			}
+			continue
+		}
+		if st.IsError() {
+			return nil, st.Error()
+		}
+		if needed > 0 && int(needed) <= len(buffer) {
+			buffer = buffer[:needed]
+			handleTableSizeHint.Store(needed)
+		}
+		return buffer, nil
+	}
+}
+
+// handleTableEntries returns the entries of the system extended handle table read into table, bounded by the
+// buffer's length whatever count the table header reports.
+func handleTableEntries(table []byte) []common.SystemExtendedHandleTableEntryInformation {
+	var header common.SystemExtendedHandleInformation
+	headerSize := unsafe.Offsetof(header.Handles)
+	if uintptr(len(table)) < headerSize {
+		return nil
+	}
+	info := (*common.SystemExtendedHandleInformation)(unsafe.Pointer(&table[0]))
+	entrySize := unsafe.Sizeof(header.Handles[0])
+	count := min(info.NumberOfHandles, (uintptr(len(table))-headerSize)/entrySize)
+	if count == 0 {
+		return nil
+	}
+	return unsafe.Slice(&info.Handles[0], count)
+}
+
+// fileQueryResult is the outcome of the queries [regularFilePath] runs on a duplicated handle.
+type fileQueryResult struct {
+	path string
+	ok   bool
+}
+
+// fileStandardInfo mirrors FILE_STANDARD_INFO, which x/sys/windows does not define.
+type fileStandardInfo struct {
+	AllocationSize int64
+	EndOfFile      int64
+	NumberOfLinks  uint32
+	DeletePending  uint8
+	Directory      uint8
+}
+
+// regularFilePath returns the final path of the duplicated handle h when it refers to a regular file on disk, and
+// closes h. The queries run on their own goroutine, which owns h, and are abandoned after [fileQueryTimeout]. At most
+// [maxFileQueriesInFlight] such goroutines exist at once; past that h is closed without being queried and
+// [ErrorFileQueriesSaturated] is returned. Returns ctx.Err() when ctx is cancelled first.
+func regularFilePath(ctx context.Context, h windows.Handle) (string, bool, error) {
+	return regularFilePathOf(ctx, h, 0, 0)
+}
+
+// regularFilePathOf is [regularFilePath] for a handle to the file object at kernel address object, or 0 when that is
+// unknown, read through a handle of process owner. While a query on object is still running, h is closed and skipped,
+// so one blocked file object holds at most one slot of [maxFileQueriesInFlight] however many handles to it are read
+// and however many passes read them.
+func regularFilePathOf(ctx context.Context, h windows.Handle, object uintptr, owner int32) (string, bool, error) {
+	if object != 0 {
+		if _, running := fileQueryObjects.LoadOrStore(object, owner); running {
+			windows.CloseHandle(h)
+			return "", false, nil
+		}
+	}
+	if fileQueriesInFlight.Add(1) > maxFileQueriesInFlight {
+		fileQueriesInFlight.Add(-1)
+		if object != 0 {
+			fileQueryObjects.Delete(object)
+		}
+		windows.CloseHandle(h)
+		return "", false, saturatedError()
+	}
+	// buffered, so an abandoned query can still deliver its result and exit
+	result := make(chan fileQueryResult, 1)
+	go func() {
+		var r fileQueryResult
+		// Deferred calls run last in, first out: the object is released while h still holds it, so its address cannot
+		// be reused meanwhile, then h is closed and the slot freed, and only then is the result sent. A caller that
+		// receives it never finds this query still holding the object or the slot.
+		defer func() { result <- r }()
+		defer fileQueriesInFlight.Add(-1)
+		defer windows.CloseHandle(h)
+		if object != 0 {
+			defer fileQueryObjects.Delete(object)
+		}
+		r.path, r.ok = queryRegularFilePath(h)
+	}()
+
+	timer := time.NewTimer(fileQueryTimeout)
+	defer timer.Stop()
+	select {
+	case r := <-result:
+		return r.path, r.ok, nil
+	case <-timer.C:
+		return "", false, nil
+	case <-ctx.Done():
+		return "", false, ctx.Err()
+	}
+}
+
+// saturatedError returns [ErrorFileQueriesSaturated] naming, in ascending order, the pids whose handles the queries
+// still in flight were read through. At most [maxFileQueriesInFlight] objects are in flight, which bounds the list.
+func saturatedError() error {
+	var owners []int32
+	fileQueryObjects.Range(func(_, value any) bool {
+		if pid, ok := value.(int32); ok && !slices.Contains(owners, pid) {
+			owners = append(owners, pid)
+		}
+		return true
+	})
+	if len(owners) == 0 {
+		return ErrorFileQueriesSaturated
+	}
+	slices.Sort(owners)
+	return fmt.Errorf("%w: blocked by pids %v", ErrorFileQueriesSaturated, owners)
+}
+
+// queryRegularFilePath returns the final path of h when it refers to a regular file on disk rather than a directory,
+// pipe, console or other device.
+//
+// The directory check queries FileStandardInfo, which needs no access right on h, so files whose handles were opened
+// without FILE_READ_ATTRIBUTES are still reported.
+func queryRegularFilePath(h windows.Handle) (string, bool) {
+	fileType, err := windows.GetFileType(h)
+	if err != nil || fileType != windows.FILE_TYPE_DISK {
+		return "", false
+	}
+	var std fileStandardInfo
+	if windows.GetFileInformationByHandleEx(
+		h, windows.FileStandardInfo, (*byte)(unsafe.Pointer(&std)), uint32(unsafe.Sizeof(std)),
+	) != nil || std.Directory != 0 {
+		return "", false
+	}
+	buf := make([]uint16, windows.MAX_PATH)
+	for {
+		n, err := windows.GetFinalPathNameByHandle(h, &buf[0], uint32(len(buf)), 0)
+		if err != nil || n == 0 {
+			return "", false
+		}
+		if int(n) < len(buf) {
+			return windows.UTF16ToString(buf[:n]), true
+		}
+		// too small: n is the size needed, including the terminating null
+		if n > syscall.MAX_LONG_PATH {
+			return "", false
+		}
+		buf = make([]uint16, n)
+	}
 }
 
 func (p *Process) ConnectionsWithContext(ctx context.Context) ([]net.ConnectionStat, error) {
