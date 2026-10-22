@@ -710,6 +710,10 @@ const (
 	// [fileQueryTimeout]. A blocked query holds an OS thread until it returns, so without a bound blocked queries
 	// would accumulate across snapshots until the runtime's thread limit ends the process.
 	maxFileQueriesInFlight = 32
+	// maxFileQueriesPerOwner bounds the slots of [maxFileQueriesInFlight] that queries read through one process's
+	// handles may hold, so the blocked handles of one process cannot take every slot and hide the open files of every
+	// other process.
+	maxFileQueriesPerOwner = 4
 	// minHandleTableBuffer is the first buffer size tried for the system handle table.
 	minHandleTableBuffer = 1 << 20
 	// maxHandleTableBuffer bounds the buffer for the system handle table, which holds about 40 bytes per handle open
@@ -720,8 +724,25 @@ const (
 // handleTableSizeHint is the size of the last system handle table read, so the next read usually needs one query.
 var handleTableSizeHint atomic.Uint32
 
-// fileQueriesInFlight counts the goroutines started by [regularFilePath] that have not yet returned.
+// fileQueriesInFlight counts the goroutines started by [regularFilePathOf] that have not yet returned.
 var fileQueriesInFlight atomic.Int32
+
+// fileQueryOwners counts, per owning pid, the query goroutines started by [regularFilePathOf] that have not yet
+// returned, against [maxFileQueriesPerOwner]. Guarded by fileQueryOwnersMu.
+var (
+	fileQueryOwnersMu sync.Mutex
+	fileQueryOwners   = make(map[int32]int)
+)
+
+// queryFile runs the queries on a duplicated handle for [regularFilePathOf]. Tests replace it with a query that
+// blocks under their control, so the lifecycle of an abandoned query is tested without depending on the kernel.
+var queryFile = queryRegularFilePath
+
+// queryHandleTable reads the system extended handle table into buf for [readHandleTable]. Tests replace it to drive
+// the buffer-growth, bound and size-hint paths deterministically.
+var queryHandleTable = func(buf *byte, size uint32, needed *uint32) common.NtStatus {
+	return common.NtQuerySystemInformation(common.SystemExtendedHandleInformationClass, buf, size, needed)
+}
 
 // fileQueryObjects maps the kernel address of each file object that a query goroutine is still running on, including
 // one abandoned after [fileQueryTimeout], to the int32 pid of the process whose handle it was read through. Every
@@ -875,22 +896,25 @@ func newOpenFilesSnapshot(onlyPid int32) (*OpenFilesSnapshot, error) {
 // readHandleTable returns the system extended handle table. It starts from the size of the last table read, and
 // grows the buffer with headroom while the table outgrows it, up to [maxHandleTableBuffer].
 func readHandleTable() ([]byte, error) {
-	size := max(handleTableSizeHint.Load(), minHandleTableBuffer)
+	return readHandleTableWithin(minHandleTableBuffer, maxHandleTableBuffer)
+}
+
+// readHandleTableWithin is [readHandleTable] with the first and largest buffer sizes as parameters, so tests can
+// exercise the growth and bound paths without gigabyte allocations.
+func readHandleTableWithin(minSize, maxSize uint32) ([]byte, error) {
+	// the hint can exceed maxSize by the headroom of the read that stored it; clamp it so a growing table cannot carry
+	// the buffer past the bound one pass at a time without ever reaching the check below
+	size := min(max(handleTableSizeHint.Load(), minSize), maxSize)
 	for {
 		buffer := make([]byte, size+size/8)
 		var needed uint32
-		st := common.NtQuerySystemInformation(
-			common.SystemExtendedHandleInformationClass,
-			&buffer[0],
-			uint32(len(buffer)),
-			&needed,
-		)
+		st := queryHandleTable(&buffer[0], uint32(len(buffer)), &needed)
 		switch st {
 		case common.STATUS_INFO_LENGTH_MISMATCH, common.STATUS_BUFFER_TOO_SMALL, common.STATUS_BUFFER_OVERFLOW:
 			// the table grew, or the call did not report its size: grow by at least half
 			size = max(needed, size+size/2)
-			if size > maxHandleTableBuffer {
-				return nil, fmt.Errorf("system handle table exceeds %d bytes", maxHandleTableBuffer)
+			if size > maxSize {
+				return nil, fmt.Errorf("system handle table exceeds %d bytes", maxSize)
 			}
 			continue
 		}
@@ -922,7 +946,7 @@ func handleTableEntries(table []byte) []common.SystemExtendedHandleTableEntryInf
 	return unsafe.Slice(&info.Handles[0], count)
 }
 
-// fileQueryResult is the outcome of the queries [regularFilePath] runs on a duplicated handle.
+// fileQueryResult is the outcome of the queries [regularFilePathOf] runs on a duplicated handle.
 type fileQueryResult struct {
 	path string
 	ok   bool
@@ -937,18 +961,16 @@ type fileStandardInfo struct {
 	Directory      uint8
 }
 
-// regularFilePath returns the final path of the duplicated handle h when it refers to a regular file on disk, and
-// closes h. The queries run on their own goroutine, which owns h, and are abandoned after [fileQueryTimeout]. At most
-// [maxFileQueriesInFlight] such goroutines exist at once; past that h is closed without being queried and
-// [ErrorFileQueriesSaturated] is returned. Returns ctx.Err() when ctx is cancelled first.
-func regularFilePath(ctx context.Context, h windows.Handle) (string, bool, error) {
-	return regularFilePathOf(ctx, h, 0, 0)
-}
-
-// regularFilePathOf is [regularFilePath] for a handle to the file object at kernel address object, or 0 when that is
-// unknown, read through a handle of process owner. While a query on object is still running, h is closed and skipped,
-// so one blocked file object holds at most one slot of [maxFileQueriesInFlight] however many handles to it are read
-// and however many passes read them.
+// regularFilePathOf returns the final path of the duplicated handle h when it refers to a regular file on disk, and
+// closes h. h is a handle to the file object at kernel address object, or 0 when that is unknown, read through a
+// handle of process owner, or 0 when there is none to account it to.
+//
+// The queries run on their own goroutine, which owns h, and are abandoned after [fileQueryTimeout]. While a query on
+// object is still running, h is closed and skipped, so one blocked file object holds at most one slot however many
+// handles to it are read and however many passes read them. At most [maxFileQueriesInFlight] query goroutines exist
+// at once, and at most [maxFileQueriesPerOwner] of them for one owner, so one process's blocked handles cannot take
+// the slots of the others. Past either limit h is closed without being queried and [ErrorFileQueriesSaturated] is
+// returned, naming the pids that hold the blocked queries. Returns ctx.Err() when ctx is cancelled first.
 func regularFilePathOf(ctx context.Context, h windows.Handle, object uintptr, owner int32) (string, bool, error) {
 	if object != 0 {
 		if _, running := fileQueryObjects.LoadOrStore(object, owner); running {
@@ -956,8 +978,20 @@ func regularFilePathOf(ctx context.Context, h windows.Handle, object uintptr, ow
 			return "", false, nil
 		}
 	}
+	// an owner already holding its share of the slots is not allowed to take the slots of other processes; report it
+	// as saturation naming the owner, so a process cannot hide its open files behind its own blocked handles silently
+	if owner > 0 && !acquireOwnerQuerySlot(owner) {
+		if object != 0 {
+			fileQueryObjects.Delete(object)
+		}
+		windows.CloseHandle(h)
+		return "", false, fmt.Errorf("%w: blocked by pids [%d]", ErrorFileQueriesSaturated, owner)
+	}
 	if fileQueriesInFlight.Add(1) > maxFileQueriesInFlight {
 		fileQueriesInFlight.Add(-1)
+		if owner > 0 {
+			releaseOwnerQuerySlot(owner)
+		}
 		if object != 0 {
 			fileQueryObjects.Delete(object)
 		}
@@ -973,11 +1007,14 @@ func regularFilePathOf(ctx context.Context, h windows.Handle, object uintptr, ow
 		// receives it never finds this query still holding the object or the slot.
 		defer func() { result <- r }()
 		defer fileQueriesInFlight.Add(-1)
+		if owner > 0 {
+			defer releaseOwnerQuerySlot(owner)
+		}
 		defer windows.CloseHandle(h)
 		if object != 0 {
 			defer fileQueryObjects.Delete(object)
 		}
-		r.path, r.ok = queryRegularFilePath(h)
+		r.path, r.ok = queryFile(h)
 	}()
 
 	timer := time.NewTimer(fileQueryTimeout)
@@ -990,6 +1027,29 @@ func regularFilePathOf(ctx context.Context, h windows.Handle, object uintptr, ow
 	case <-ctx.Done():
 		return "", false, ctx.Err()
 	}
+}
+
+// acquireOwnerQuerySlot takes one of owner's [maxFileQueriesPerOwner] query slots, reporting false when owner already
+// holds them all.
+func acquireOwnerQuerySlot(owner int32) bool {
+	fileQueryOwnersMu.Lock()
+	defer fileQueryOwnersMu.Unlock()
+	if fileQueryOwners[owner] >= maxFileQueriesPerOwner {
+		return false
+	}
+	fileQueryOwners[owner]++
+	return true
+}
+
+// releaseOwnerQuerySlot returns a slot taken by [acquireOwnerQuerySlot], dropping owner once it holds none.
+func releaseOwnerQuerySlot(owner int32) {
+	fileQueryOwnersMu.Lock()
+	defer fileQueryOwnersMu.Unlock()
+	if fileQueryOwners[owner] <= 1 {
+		delete(fileQueryOwners, owner)
+		return
+	}
+	fileQueryOwners[owner]--
 }
 
 // saturatedError returns [ErrorFileQueriesSaturated] naming, in ascending order, the pids whose handles the queries
