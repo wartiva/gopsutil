@@ -859,28 +859,57 @@ func uniqueNetnsPaths(procDir string) (map[nsKey]string, error) {
 	return seen, nil
 }
 
-func switchNamespace[T any](targetNamespace string, f func() (T, error)) (ret T, err error) {
+// switchNamespace runs f in the network namespace at targetNamespace on a dedicated goroutine and returns its result.
+// The goroutine exits as soon as f returns, so if switching its thread back fails, the runtime terminates that
+// thread with it and no caller ever runs in the other namespace.
+func switchNamespace[T any](targetNamespace string, f func() (T, error)) (T, error) {
+	type result struct {
+		ret T
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		ret, err := switchNamespaceLocked(targetNamespace, f)
+		done <- result{ret: ret, err: err}
+	}()
+	r := <-done
+	return r.ret, r.err
+}
+
+// switchNamespaceLocked runs f with the calling thread in the network namespace at targetNamespace and switches it
+// back afterwards. If switching back fails, the thread is left locked, so the runtime terminates it when the
+// goroutine exits instead of reusing a thread that is still in the other namespace.
+func switchNamespaceLocked[T any](targetNamespace string, f func() (T, error)) (ret T, err error) {
 	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
 
 	origFD, err := currentNetnsFD()
 	if err != nil {
+		runtime.UnlockOSThread()
 		return ret, fmt.Errorf("getting current namespace fd failed: %w", err)
 	}
 	defer unix.Close(origFD)
 
 	targetFD, err := openNetnsFD(targetNamespace)
 	if err != nil {
+		runtime.UnlockOSThread()
 		return ret, fmt.Errorf("opening target namespace fd failed: %w", err)
 	}
 
 	if setErr := unix.Setns(targetFD, unix.CLONE_NEWNET); setErr != nil {
 		unix.Close(targetFD)
+		runtime.UnlockOSThread()
 		return ret, fmt.Errorf("setns to target failed: %w", setErr)
 	}
 	unix.Close(targetFD)
 
-	defer unix.Setns(origFD, unix.CLONE_NEWNET)
+	defer func() {
+		if restoreErr := unix.Setns(origFD, unix.CLONE_NEWNET); restoreErr != nil {
+			// leave the thread locked so the runtime terminates it rather than reusing it in the wrong namespace
+			err = errors.Join(err, fmt.Errorf("restoring the original net namespace failed: %w", restoreErr))
+			return
+		}
+		runtime.UnlockOSThread()
+	}()
 	return f()
 }
 
